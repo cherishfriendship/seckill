@@ -2,6 +2,7 @@ package com.xm.service.impl;
 
 import com.xm.dao.SeckillDao;
 import com.xm.dao.SuccessKilledDao;
+import com.xm.dao.cache.RedisDao;
 import com.xm.dto.Exposer;
 import com.xm.dto.SeckillExecution;
 import com.xm.entity.Seckill;
@@ -13,6 +14,7 @@ import com.xm.exception.SeckillException;
 import com.xm.service.SeckillService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.DigestUtils;
@@ -34,6 +36,9 @@ public class SeckillServiceImpl implements SeckillService {
     @Resource
     private SeckillDao seckillDao;
 
+    @Autowired
+    private RedisDao redisDao;
+
     @Resource
     private SuccessKilledDao successKilledDao;
 
@@ -50,10 +55,19 @@ public class SeckillServiceImpl implements SeckillService {
 
     @Override
     public Exposer exportSeckillUrl(long seckillId) {
-        Seckill seckill = seckillDao.queryById(seckillId);
+
+        //先使用redis缓存，一般放入缓存的对象在超时时间内是不会被改变的，通过超时来维护数据一致性。如果要改变那就废弃掉，重新建一个。
+        Seckill seckill = redisDao.getSeckill(seckillId);
         if (seckill == null) {
-            return new Exposer(false, seckillId);
+            seckill = seckillDao.queryById(seckillId);
+            if (seckill == null) {
+                return new Exposer(false, seckillId);
+            } else {
+                String result = redisDao.putSeckill(seckill);
+                logger.info("result", result);
+            }
         }
+
         Date startTime = seckill.getStartTime();
         Date endTime = seckill.getEndTime();
         Date nowTime = new Date();
@@ -84,13 +98,14 @@ public class SeckillServiceImpl implements SeckillService {
 
         //使用try把所有的检查异常(编译异常)转化为运行异常（非检查异常）
         try {
-            int updateCount = seckillDao.reduceNumber(seckillId, nowTime);
-            if (updateCount <= 0) {
-                throw new SeckillCloseException("seckill is closed");
+            //减少热点商品的行级锁持有时间，先执行插入sql，再执行update语句（并发最多）
+            int insertCount = successKilledDao.insertSuccessKilled(seckillId, userPhone);
+            if (insertCount <= 0) {
+                throw new RepeatKillException("repeated seckill");
             } else {
-                int insertCount = successKilledDao.insertSuccessKilled(seckillId, userPhone);
-                if (insertCount <= 0) {
-                    throw new RepeatKillException("repeated seckill");
+                int updateCount = seckillDao.reduceNumber(seckillId, nowTime);
+                if (updateCount <= 0) {
+                    throw new SeckillCloseException("seckill is closed");
                 } else {
                     SuccessKilled successKilled = successKilledDao.queryByIdWithSeckill(seckillId, userPhone);
                     return new SeckillExecution(seckillId, SeckillStatEnum.SUCCESS, successKilled);
